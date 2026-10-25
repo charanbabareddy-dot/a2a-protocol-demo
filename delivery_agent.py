@@ -7,14 +7,14 @@ It does two things, like every A2A agent:
   1. Publishes an Agent Card at  GET /.well-known/agent-card.json
      (who it is, what it can do, where to send messages)
   2. Accepts JSON-RPC 2.0 requests at  POST /
-     - message/send : start or continue a task
-     - tasks/get    : check a task's current state
+     - SendMessage : start or continue a task
+     - GetTask     : check a task's current state
 
 Skill: estimate delivery days for an Indian pincode.
-If the pincode is missing, the task goes to "input-required" and waits for more input.
+If the pincode is missing, the task goes to TASK_STATE_INPUT_REQUIRED and waits for more input.
 
-This is a learning sample that follows the A2A v0.3 message shape.
-For real projects, use the official A2A SDK.
+This is a learning sample written by hand so you can SEE the JSON.
+It follows the A2A v1.0 JSON-RPC format. For real projects, use the official A2A SDK.
 """
 
 import json
@@ -24,13 +24,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST, PORT = "127.0.0.1", 8765
 BASE_URL = f"http://{HOST}:{PORT}"
+A2A_VERSION = "1.0"
 
 AGENT_CARD = {
     "name": "Delivery Agent",
     "description": "Estimates delivery days for an Indian pincode.",
-    "url": f"{BASE_URL}/",
     "version": "1.0.0",
-    "protocolVersion": "0.3.0",
+    # Where to reach the agent, which binding and which protocol version
+    "supportedInterfaces": [
+        {"url": BASE_URL, "protocolBinding": "JSONRPC", "protocolVersion": A2A_VERSION}
+    ],
     "capabilities": {"streaming": False},
     "defaultInputModes": ["text/plain"],
     "defaultOutputModes": ["text/plain", "application/json"],
@@ -39,6 +42,7 @@ AGENT_CARD = {
             "id": "estimate_delivery",
             "name": "Estimate delivery",
             "description": "Give a 6 digit pincode and get the expected delivery days.",
+            "tags": ["delivery", "pincode"],
             "examples": ["How many days to deliver to 500081?"],
         }
     ],
@@ -50,55 +54,64 @@ DEFAULT_DAYS = ("Other regions", 5)
 
 TASKS: dict[str, dict] = {}   # in-memory task store (lost when the server stops)
 
+# JSON-RPC error codes (the -32001 and -32009 codes are defined by A2A)
+PARSE_ERROR, METHOD_NOT_FOUND, INVALID_PARAMS = -32700, -32601, -32602
+TASK_NOT_FOUND, VERSION_NOT_SUPPORTED = -32001, -32009
+
 
 def text_of(message: dict) -> str:
-    return " ".join(p.get("text", "") for p in message.get("parts", []) if p.get("kind") == "text")
+    return " ".join(p["text"] for p in message.get("parts", []) if "text" in p)
 
 
 def agent_message(text: str, task_id: str, context_id: str) -> dict:
-    return {"kind": "message", "role": "agent", "messageId": str(uuid.uuid4()),
-            "taskId": task_id, "contextId": context_id, "parts": [{"kind": "text", "text": text}]}
+    return {"messageId": str(uuid.uuid4()), "contextId": context_id, "taskId": task_id,
+            "role": "ROLE_AGENT", "parts": [{"text": text}]}
 
 
-def handle_message_send(params: dict) -> dict:
+def handle_send_message(params: dict) -> dict:
     message = params["message"]
     task_id = message.get("taskId") or str(uuid.uuid4())      # continue a task, or start a new one
     context_id = message.get("contextId") or str(uuid.uuid4())
-    task = TASKS.setdefault(task_id, {"kind": "task", "id": task_id, "contextId": context_id,
-                                      "history": [], "artifacts": []})
-    task["history"].append(message)
+    task = TASKS.setdefault(task_id, {"id": task_id, "contextId": context_id, "history": []})
+    task["history"].append({**message, "taskId": task_id, "contextId": context_id})
 
     match = re.search(r"\b(\d{6})\b", text_of(message))
     if not match:
         reply = agent_message("Please share a 6 digit pincode.", task_id, context_id)
-        task["status"] = {"state": "input-required", "message": reply}
+        task["status"] = {"state": "TASK_STATE_INPUT_REQUIRED", "message": reply}
     else:
         pincode = match.group(1)
         region, days = REGION_DAYS.get(pincode[0], DEFAULT_DAYS)
         reply = agent_message(f"Delivery to {pincode} takes about {days} days.", task_id, context_id)
-        task["status"] = {"state": "completed", "message": reply}
+        task["status"] = {"state": "TASK_STATE_COMPLETED", "message": reply}
         task["artifacts"] = [{
             "artifactId": str(uuid.uuid4()),
             "name": "delivery_estimate",
-            "parts": [{"kind": "data", "data": {"pincode": pincode, "region": region, "days": days}}],
+            "parts": [{"data": {"pincode": pincode, "region": region, "days": days}}],
         }]
     task["history"].append(reply)
-    return task
+    return {"task": task}          # SendMessage returns either {"task": ...} or {"message": ...}
 
 
-def handle_rpc(request: dict) -> dict:
+def error(rpc_id, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+def handle_rpc(request: dict, version: str) -> dict:
     rpc_id, method, params = request.get("id"), request.get("method"), request.get("params", {})
+    if version != A2A_VERSION:
+        return error(rpc_id, VERSION_NOT_SUPPORTED, f"A2A version '{version}' is not supported. Expected '{A2A_VERSION}'.")
     try:
-        if method == "message/send":
-            return {"jsonrpc": "2.0", "id": rpc_id, "result": handle_message_send(params)}
-        if method == "tasks/get":
+        if method == "SendMessage":
+            return {"jsonrpc": "2.0", "id": rpc_id, "result": handle_send_message(params)}
+        if method == "GetTask":
             task = TASKS.get(params.get("id"))
             if task is None:
-                return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32001, "message": "Task not found"}}
+                return error(rpc_id, TASK_NOT_FOUND, "Task not found")
             return {"jsonrpc": "2.0", "id": rpc_id, "result": task}
-        return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+        return error(rpc_id, METHOD_NOT_FOUND, "Method not found")
     except (KeyError, TypeError) as exc:
-        return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32602, "message": f"Invalid params: {exc}"}}
+        return error(rpc_id, INVALID_PARAMS, f"Invalid params: {exc}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -121,9 +134,11 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             request = json.loads(self.rfile.read(length))
         except (ValueError, json.JSONDecodeError):
-            self._send(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+            self._send(200, error(None, PARSE_ERROR, "Parse error"))
             return
-        self._send(200, handle_rpc(request))
+        # The client says which protocol version it speaks. No header means the old 0.3.
+        version = self.headers.get("A2A-Version", "0.3")
+        self._send(200, handle_rpc(request, version))
 
     def log_message(self, *args):   # keep the console quiet
         pass

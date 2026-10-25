@@ -1,13 +1,20 @@
 # A2A Protocol Demo: two agents talking
 
-A small, runnable sample of the **A2A (Agent2Agent) protocol**. A Shop Assistant agent finds a Delivery Agent, asks it a question, gives more input when asked, and reads back a structured result.
+A small, runnable sample of the **A2A (Agent2Agent) protocol, version 1.0**. A Shop Assistant agent finds a Delivery Agent, asks it a question, gives more input when asked, and reads back a structured result.
 
-It uses **only the Python standard library**. No API key, no installs.
+The same demo is built **two ways**:
+
+| Folder | How | Why |
+|---|---|---|
+| root | Python standard library only, JSON written by hand | You can **see** every JSON message. No installs, no API key |
+| `sdk/` | Official A2A Python SDK (`a2a-sdk` 1.2.3) | How real projects build it. The SDK writes the JSON for you |
+
+Both versions speak the same protocol, so they work together: the SDK client can talk to the hand written server and the other way round. I tested all four combinations.
 
 ## Contents
 1. [What is A2A](#1-what-is-a2a)
 2. [How it works](#2-how-it-works)
-3. [The demo](#3-the-demo)
+3. [The JSON on the wire](#3-the-json-on-the-wire)
 4. [Run it](#4-run-it)
 5. [Task states](#5-task-states)
 6. [A2A vs MCP vs LangGraph](#6-a2a-vs-mcp-vs-langgraph)
@@ -32,20 +39,18 @@ sequenceDiagram
     participant C as Shop Assistant (client)
     participant S as Delivery Agent (server)
     C->>S: GET /.well-known/agent-card.json
-    S-->>C: Agent Card (name, skills, url)
-    C->>S: POST message/send "When will my books arrive?"
-    S-->>C: Task state = input-required "Please share a pincode"
-    C->>S: POST message/send "500081" (same taskId)
-    S-->>C: Task state = completed + artifact {days: 2}
-    C->>S: POST tasks/get
+    S-->>C: Agent Card (name, skills, supportedInterfaces)
+    C->>S: SendMessage "When will my books arrive?"
+    S-->>C: Task: TASK_STATE_INPUT_REQUIRED "Please share a pincode"
+    C->>S: SendMessage "500081" (same taskId)
+    S-->>C: Task: TASK_STATE_COMPLETED + artifact {days: 2}
+    C->>S: GetTask
     S-->>C: Full task with history
 ```
 
-Three building blocks:
-
 ```mermaid
 flowchart LR
-    A[Agent Card<br/>discovery]:::box --> B[Message<br/>parts: text, data, file]:::box
+    A[Agent Card<br/>discovery]:::box --> B[Message<br/>parts: text, data, url, raw]:::box
     B --> C[Task<br/>has a state]:::hi
     C --> D[Artifact<br/>the result]:::box
     classDef box fill:#E3EAF5,stroke:#1E3A8A,color:#0B1F4D
@@ -54,68 +59,111 @@ flowchart LR
 
 | Piece | Meaning |
 |---|---|
-| Agent Card | JSON at `/.well-known/agent-card.json`: name, description, skills, endpoint URL |
-| Message | One turn from `user` or `agent`, made of parts (`text`, `data`, `file`) |
+| Agent Card | JSON at `/.well-known/agent-card.json`: name, description, skills, and `supportedInterfaces` (URL, binding, protocol version) |
+| Message | One turn from `ROLE_USER` or `ROLE_AGENT`, made of parts (`text`, `data`, `url`, `raw`) |
 | Task | A unit of work with an id and a state. Several messages can belong to one task |
 | Artifact | The output of a task, for example structured JSON data |
-| Methods used here | `message/send`, `tasks/get` (others: `message/stream`, `tasks/cancel`, `tasks/resubscribe`) |
+| Methods used here | `SendMessage`, `GetTask` (others: `SendStreamingMessage`, `CancelTask`, push notification methods) |
 
-## 3. The demo
+## 3. The JSON on the wire
 
-| File | Role |
+The client sends an HTTP header `A2A-Version: 1.0`. Without it, the server assumes the old version 0.3 and rejects the request.
+
+**Request**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "f1c2...",
+      "role": "ROLE_USER",
+      "parts": [{ "text": "When will my books arrive?" }]
+    }
+  }
+}
+```
+
+**Response (shortened)**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "result": {
+    "task": {
+      "id": "0611f689...",
+      "contextId": "9a7e...",
+      "status": {
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "message": { "role": "ROLE_AGENT", "parts": [{ "text": "Please share a 6 digit pincode." }] }
+      }
+    }
+  }
+}
+```
+
+**Errors used in this demo**
+
+| Code | Meaning |
 |---|---|
-| `delivery_agent.py` | A2A **server**. Serves the Agent Card and handles `message/send` and `tasks/get`. Skill: estimate delivery days for a 6 digit pincode |
-| `shop_assistant.py` | A2A **client**. Discovers the agent, sends messages, continues the task, checks the result |
-| `run_demo.py` | Starts both in one command |
-
-The delivery rule is made up for learning: pincodes starting with 5 take 2 days, with 6 take 3 days, others take 5 days.
+| -32700 | Parse error (the body is not valid JSON) |
+| -32601 | Method not found |
+| -32602 | Invalid params |
+| -32001 | Task not found (A2A specific) |
+| -32009 | Version not supported (A2A specific) |
 
 ## 4. Run it
 
+**Hand written version (no installs):**
 ```bash
 python run_demo.py
 ```
 
-Or in two terminals:
-
-```bash
-python delivery_agent.py      # terminal 1: the server
-python shop_assistant.py      # terminal 2: the client
-```
-
 Expected output:
-
 ```text
 1. Found agent: Delivery Agent  |  skills: ['Estimate delivery']
-2. Task f4e7b8aa... state = input-required  |  agent says: Please share a 6 digit pincode.
-3. Task f4e7b8aa... state = completed  |  agent says: Delivery to 500081 takes about 2 days.
-4. tasks/get -> state = completed  |  artifact data = {'pincode': '500081', 'region': 'South (Telangana, Andhra Pradesh, Karnataka)', 'days': 2}
+2. Task 0611f689... state = TASK_STATE_INPUT_REQUIRED  |  agent says: Please share a 6 digit pincode.
+3. Task 0611f689... state = TASK_STATE_COMPLETED  |  agent says: Delivery to 500081 takes about 2 days.
+4. GetTask -> state = TASK_STATE_COMPLETED  |  artifact data = {'pincode': '500081', 'region': 'South (Telangana, Andhra Pradesh, Karnataka)', 'days': 2}
    Messages in task history: 4
 ```
 
-Notice that steps 2 and 3 show the **same task id**. That is how A2A handles multi turn work.
+Steps 2 and 3 show the **same task id**. That is how A2A handles multi turn work.
 
-You can also look at the Agent Card in a browser while the server runs: `http://127.0.0.1:8765/.well-known/agent-card.json`
+**SDK version:**
+```bash
+cd sdk
+pip install -r requirements.txt
+python delivery_agent_sdk.py      # terminal 1
+python shop_assistant_sdk.py      # terminal 2
+```
+
+While a server runs, open the Agent Card in a browser: `http://127.0.0.1:8765/.well-known/agent-card.json` (hand written) or `http://127.0.0.1:9999/.well-known/agent-card.json` (SDK).
+
+The delivery rule is made up for learning: pincodes starting with 5 take 2 days, with 6 take 3 days, others take 5 days.
 
 ## 5. Task states
 
 ```mermaid
 stateDiagram-v2
-    [*] --> submitted
-    submitted --> working
-    working --> input_required: needs more info
-    input_required --> working: client sends more input
-    working --> completed
-    working --> failed
-    working --> canceled
-    submitted --> rejected
-    completed --> [*]
-    failed --> [*]
-    canceled --> [*]
-    rejected --> [*]
+    [*] --> SUBMITTED
+    SUBMITTED --> WORKING
+    WORKING --> INPUT_REQUIRED: needs more info
+    INPUT_REQUIRED --> WORKING: client sends more input
+    WORKING --> AUTH_REQUIRED: needs login
+    AUTH_REQUIRED --> WORKING
+    WORKING --> COMPLETED
+    WORKING --> FAILED
+    WORKING --> CANCELED
+    SUBMITTED --> REJECTED
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELED --> [*]
+    REJECTED --> [*]
 ```
 
-`completed`, `failed`, `canceled` and `rejected` are final. Once a task reaches one of them, it does not change again. This demo answers instantly, so you only see `input-required` and `completed`.
+On the wire each state has the prefix `TASK_STATE_`, for example `TASK_STATE_COMPLETED`. `COMPLETED`, `FAILED`, `CANCELED` and `REJECTED` are final: once a task reaches one of them, it does not change again. This demo answers instantly, so you only see `INPUT_REQUIRED` and `COMPLETED`.
 
 ## 6. A2A vs MCP vs LangGraph
 
@@ -129,17 +177,18 @@ They work together: an agent built with LangGraph can use MCP for tools and A2A 
 
 ## 7. Common mistakes
 
-1. **Starting a new task for a follow up.** If the agent says `input-required`, send the next message with the **same `taskId`**, or the agent loses the context.
-2. **Hardcoding the endpoint.** Read the `url` from the Agent Card instead.
-3. **Thinking A2A replaces MCP.** They solve different problems (see section 6).
-4. **No authentication.** This demo has none and only listens on `127.0.0.1`. Real agents must declare and check auth.
-5. **Writing the protocol by hand in production.** This sample is for learning. Use the official A2A SDK for real projects.
+1. **Starting a new task for a follow up.** If the agent asks for input, send the next message with the **same `taskId`**, or the agent loses the context.
+2. **Forgetting the `A2A-Version` header.** A v1.0 server treats a request without it as version 0.3 and returns error -32009.
+3. **Using old 0.3 names with a 1.0 server.** In 0.3 the method was `message/send` and the role was `"user"`. In 1.0 it is `SendMessage` and `ROLE_USER`.
+4. **Hardcoding the endpoint.** Read the URL from `supportedInterfaces` in the Agent Card.
+5. **Expecting integers back from the SDK.** Data parts travel as JSON objects, so the SDK returns numbers like `2.0`. Convert with `int()` if you need a whole number.
+6. **No authentication.** This demo has none and only listens on `127.0.0.1`. Real agents must declare and check auth.
 
 ## 8. Interview questions
 
 1. **What problem does A2A solve?** It lets agents from different vendors and frameworks communicate through one standard.
 2. **How does a client discover an agent?** By reading its Agent Card at `/.well-known/agent-card.json`.
-3. **What transport does A2A use?** JSON-RPC 2.0 over HTTP, with Server Sent Events for streaming.
+3. **What transport does A2A use?** HTTP with a binding such as JSON-RPC 2.0 (also gRPC and HTTP+JSON/REST). Streaming uses Server Sent Events.
 4. **What is the difference between a message and an artifact?** A message is one conversational turn. An artifact is the output produced by the task.
 5. **How is A2A different from MCP?** MCP connects an agent to tools and data. A2A connects an agent to other agents.
 
@@ -149,6 +198,6 @@ A2A gives agents a visiting card and a common language, so they can find each ot
 
 ---
 
-**Note:** The spec moves fast. This sample follows the v0.3 message shape (`kind` fields, `protocolVersion: 0.3.0`). Check the official A2A documentation for the latest version before building on it.
+**Version note:** This demo follows A2A **v1.0** and was tested with `a2a-sdk` 1.2.3. The spec moves fast, so check the official A2A documentation before building on it.
 
-License: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+License: [MIT](LICENSE)
